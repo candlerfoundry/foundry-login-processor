@@ -4,16 +4,16 @@ Foundry Login Processor
 Replaces foundry_startup_launcher.py + nightly_watcher.py
 
 Runs automatically when Emily logs in (via Windows Startup folder shortcut).
-Scans Podcast, Unstuck, and TheoEd libraries for missing assets and processes
-them immediately — no scheduling, no Task Scheduler required.
+Scans the ENTIRE Dropbox for videos missing SRT / Words JSON / Captioned output
+and processes them immediately — no scheduling, no Task Scheduler required.
 
-3MB videos are NEVER processed automatically. A notification row appears in
-the status window if new 3MB files are detected.
+3MB videos are NEVER processed automatically. A notification appears in the
+status window if new 3MB files are detected.
 
 Behavior:
   - Waits 60 seconds on login for Dropbox to sync
   - Checks .last_run_date to avoid double-running on same day
-  - Scans all libraries for missing SRT / Words JSON / Captioned video
+  - Walks ALL of Dropbox (excluding skip list) for missing assets
   - If nothing to do: exits silently, marks today as done
   - If work found: opens a small status window and starts processing immediately
   - All output logged to foundry_login_processor_log.txt (next to this script)
@@ -28,14 +28,17 @@ Canonical output naming (matches Caption_App.pyw):
   SRT:         {base} - Transcript (Time-Stamped).srt
   Words JSON:  {base} - Transcript (Words).json
 
+Audio-only detection: if the source file is an .mp3, captions are skipped.
+No hardcoded series list required.
+
 Install:
   1. Press Win+R -> shell:startup -> Enter
   2. Create shortcut with target:
-       C:\\Windows\\py.exe C:\\Users\\esavant\\Dropbox\\Scripts\\foundry_login_processor.py
+       C:\\Python314\\python.exe C:\\Users\\esavant\\Dropbox\\Scripts\\foundry_login_processor.py
   3. Done — runs every time you log in
 
-Run manually any time:
-  py foundry_login_processor.py
+Run manually any time (skip sync wait and ran-today guard):
+  C:\\Python314\\python.exe foundry_login_processor.py --now
 """
 
 import os
@@ -63,29 +66,30 @@ ctypes.windll.kernel32.SetThreadExecutionState(
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
+DROPBOX_ROOT = os.path.join(os.path.expanduser("~"), "Dropbox")
 
-WATCH_LIBRARIES = {
-    "Podcast": {
-        "path": r"C:\Users\esavant\Dropbox\Podcast",
-        "audio_only_series": ["Wholehearted Ministry", "Scholar, Unscripted", "Chaplaincy"],
-    },
-    "Unstuck": {
-        "path": r"C:\Users\esavant\Dropbox\Unstuck\Everyday Stories",
-        "audio_only_series": [],
-    },
-    "TheoEd": {
-        "path": r"C:\Users\esavant\Dropbox\TheoEd",
-        "audio_only_series": [],
-    },
+# Folders directly under Dropbox root to SKIP entirely.
+# These are either manually-processed (3MB), infrastructure (Scripts, FFMPEG),
+# or not video libraries (On-Demand Lessons, Operations, YouTube, etc.)
+SKIP_FOLDERS = {
+    "3mb",
+    "scripts",
+    "ffmpeg",
+    "on-demand lessons",
+    "operations",
+    "youtube",
+    "social media clips",   # output folder — never scan for missing assets
+    ".dropbox.cache",
+    "dropbox cache",
 }
 
-MB3_PATH          = r"C:\Users\esavant\Dropbox\3MB\Captioned 3MB Videos"
-RAN_TODAY_MARKER  = os.path.join(SCRIPT_DIR, ".last_run_date")
-LOG_PATH          = os.path.join(SCRIPT_DIR, "foundry_login_processor_log.txt")
+MB3_PATH         = os.path.join(DROPBOX_ROOT, "3MB")
+RAN_TODAY_MARKER = os.path.join(SCRIPT_DIR, ".last_run_date")
+LOG_PATH         = os.path.join(SCRIPT_DIR, "foundry_login_processor_log.txt")
 
-WHISPER_MODEL     = "medium"
-STYLE_STR         = "Fontname=Arial,Outline=1,Shadow=0,BorderStyle=1,Spacing=1"
+WHISPER_MODEL    = "medium"
+STYLE_STR        = "Fontname=Arial,Outline=1,Shadow=0,BorderStyle=1,Spacing=1"
 DROPBOX_SYNC_WAIT = 60  # seconds to wait for Dropbox to sync on login
 
 # ── Brand colors ──────────────────────────────────────────────────────────────
@@ -107,8 +111,8 @@ CF_RED     = "#E05555"
 
 def has_captioned(files):
     """
-    True if any file looks like a captioned video.
-    Matches: (Captioned).mp4 / - Captioned.mp4 / _captioned.mp4 / captioned.mp4
+    True if any file looks like a captioned video output.
+    Matches: (Captioned).mp4 / - Captioned.mp4 / _captioned.mp4
     Excludes: anything with 'uncaptioned' in the name.
     """
     for f in files:
@@ -136,7 +140,6 @@ def has_words_json(files):
         if not fl.endswith('.json'):
             continue
         stem = os.path.splitext(fl)[0]
-        # Remove punctuation/spaces for loose matching
         normalized = re.sub(r'[\s\-_()\[\]]+', '', stem)
         if 'word' in normalized or 'timestamp' in normalized:
             return True
@@ -145,37 +148,35 @@ def has_words_json(files):
 
 def find_source_file(files, folder):
     """
-    Return the full path of the source media file, or None.
+    Return the full path of the source media file to process, or None.
 
     Priority:
       0 — (Uncaptioned).mp4 or - Uncaptioned.mp4  (properly named source)
-      1 — .mp3  (audio-only series)
+      1 — .mp3  (audio-only source)
       2 — (Uncaptioned).mov / - Uncaptioned.mov
       3 — any .mp4 that is NOT a captioned output  (fallback for mis-named files)
-      4 — any .mov that is NOT a captioned output  (fallback)
+      4 — any .mov that is NOT a captioned output
 
-    This ensures that files uploaded without proper naming conventions
-    (e.g. "Scholar Unscripted - Robert Franklin.mp4") are still detected
-    as long as SRT / Words JSON are missing from the folder.
+    This ensures files uploaded without naming conventions are still detected.
     """
     candidates = []
     for f in files:
-        fl = f.lower()
+        fl  = f.lower()
         ext = os.path.splitext(fl)[1]
         is_captioned_output = 'captioned' in fl and 'uncaptioned' not in fl
 
         if ext == '.mp4':
             if 'uncaptioned' in fl:
-                candidates.append((0, f))          # properly named — highest priority
+                candidates.append((0, f))
             elif not is_captioned_output:
-                candidates.append((3, f))          # fallback: any non-captioned mp4
+                candidates.append((3, f))
         elif ext == '.mp3':
-            candidates.append((1, f))              # audio-only source
+            candidates.append((1, f))
         elif ext == '.mov':
             if 'uncaptioned' in fl:
-                candidates.append((2, f))          # properly named mov
+                candidates.append((2, f))
             elif not is_captioned_output:
-                candidates.append((4, f))          # fallback: any non-captioned mov
+                candidates.append((4, f))
 
     if not candidates:
         return None
@@ -189,69 +190,84 @@ def get_base_name(filepath):
     Handles: (Uncaptioned) / - Uncaptioned / _Uncaptioned and .mp3 sources.
     """
     name = os.path.splitext(os.path.basename(filepath))[0]
-    # Remove .mp3 leftover (mp3 source has no video extension to strip)
     name = re.sub(r'\.mp3$', '', name, flags=re.IGNORECASE)
-    # Remove (Uncaptioned) with optional surrounding spaces
     name = re.sub(r'\s*\(Uncaptioned\)\s*$', '', name, flags=re.IGNORECASE)
-    # Remove - Uncaptioned / – Uncaptioned / _Uncaptioned at end
     name = re.sub(r'\s*[-–_]\s*Uncaptioned\s*$', '', name, flags=re.IGNORECASE)
     return name.strip()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LIBRARY SCANNER
+# DROPBOX-WIDE SCANNER
+# No hardcoded folder map — walks all of Dropbox, skips excluded folders.
 # ══════════════════════════════════════════════════════════════════════════════
 
-def scan_libraries():
+def _should_skip_dir(dirpath):
     """
-    Walk all watch libraries. Return list of work items, each a dict with:
-      source, base_name, folder, lib_name, audio_only,
-      needs_srt, needs_words, needs_cap
+    True if this directory (or any ancestor below DROPBOX_ROOT) matches SKIP_FOLDERS.
+    Checked by comparing the first path component under Dropbox root.
+    """
+    try:
+        rel = os.path.relpath(dirpath, DROPBOX_ROOT)
+    except ValueError:
+        return True  # different drive on Windows — skip
+    top = rel.split(os.sep)[0].lower()
+    return top in SKIP_FOLDERS
+
+
+def scan_dropbox():
+    """
+    Walk the entire Dropbox, skipping excluded folders.
+    Return list of work items, each a dict with:
+      source, base_name, folder, display_path,
+      audio_only, needs_srt, needs_words, needs_cap
     """
     work_items = []
 
-    for lib_name, lib_config in WATCH_LIBRARIES.items():
-        base              = lib_config["path"]
-        audio_only_series = lib_config.get("audio_only_series", [])
+    if not os.path.isdir(DROPBOX_ROOT):
+        return work_items
 
-        if not os.path.isdir(base):
+    for root, dirs, files in os.walk(DROPBOX_ROOT):
+        # Prune excluded top-level dirs in-place so os.walk won't descend into them
+        if root == DROPBOX_ROOT:
+            dirs[:] = [d for d in dirs if d.lower() not in SKIP_FOLDERS]
             continue
 
-        for root, dirs, files in os.walk(base):
-            source = find_source_file(files, root)
-            if not source:
-                continue
+        if _should_skip_dir(root):
+            dirs[:] = []
+            continue
 
-            # Determine audio-only from series folder name.
-            # Use fuzzy match — strip punctuation + lowercase — so "Scholar Unscripted"
-            # matches config entry "Scholar, Unscripted" regardless of commas/spacing.
-            rel         = os.path.relpath(root, base)
-            series_name = rel.split(os.sep)[0] if os.sep in rel else ""
+        source = find_source_file(files, root)
+        if not source:
+            continue
 
-            def _normalize(s):
-                return re.sub(r'[^a-z0-9 ]', '', s.lower()).strip()
+        # Audio-only: determined by file type, not folder name
+        audio_only = source.lower().endswith('.mp3')
 
-            audio_only = _normalize(series_name) in [_normalize(s) for s in audio_only_series]
+        got_srt   = has_srt(files)
+        got_words = has_words_json(files)
+        got_cap   = has_captioned(files)
 
-            got_srt   = has_srt(files)
-            got_words = has_words_json(files)
-            got_cap   = has_captioned(files)
+        needs_srt   = not got_srt
+        needs_words = not got_words
+        needs_cap   = not audio_only and not got_cap
 
-            needs_srt   = not got_srt
-            needs_words = not got_words
-            needs_cap   = not audio_only and not got_cap
+        if needs_srt or needs_words or needs_cap:
+            # Human-readable path for display (relative to Dropbox root)
+            try:
+                display_path = os.path.relpath(root, DROPBOX_ROOT)
+            except ValueError:
+                display_path = root
 
-            if needs_srt or needs_words or needs_cap:
-                work_items.append({
-                    "source":      source,
-                    "base_name":   get_base_name(source),
-                    "folder":      root,
-                    "lib_name":    lib_name,
-                    "audio_only":  audio_only,
-                    "needs_srt":   needs_srt,
-                    "needs_words": needs_words,
-                    "needs_cap":   needs_cap,
-                })
+            work_items.append({
+                "source":       source,
+                "base_name":    get_base_name(source),
+                "folder":       root,
+                "display_path": display_path,
+                "audio_only":   audio_only,
+                "needs_srt":    needs_srt,
+                "needs_words":  needs_words,
+                "needs_cap":    needs_cap,
+            })
 
     return work_items
 
@@ -357,7 +373,6 @@ def ensure_local(path, timeout=600, poll_interval=10):
         log(f"  File not found: {path}")
         return False
 
-    # Check if already local by attempting to read first bytes
     try:
         with open(path, 'rb') as f:
             f.read(1024)
@@ -374,7 +389,6 @@ def ensure_local(path, timeout=600, poll_interval=10):
                 data = f.read(1024)
             if data:
                 log(f"  ✓ File is now local.")
-                # Wait a few extra seconds to let Dropbox finish writing
                 time.sleep(5)
                 return True
         except Exception:
@@ -392,12 +406,10 @@ def burn_captions(video_in, srt_path, video_out):
     tmp_srt   = os.path.join(tmp_dir, "foundry_caption_temp.srt")
     tmp_video = os.path.join(tmp_dir, "foundry_src_burn_temp.mp4")
 
-    # Copy both source video AND srt to clean temp paths so ffmpeg never sees
-    # special characters (&, apostrophes, accents, dots) in any argument.
     shutil.copy2(video_in, tmp_video)
     shutil.copy2(srt_path, tmp_srt)
     srt_escaped = tmp_srt.replace("\\", "/").replace(":", "\\:")
-    video_in    = tmp_video  # use the clean temp copy
+    video_in    = tmp_video
 
     result = subprocess.run([
         "ffmpeg", "-y",
@@ -435,8 +447,9 @@ def process_item(item, model):
     words_path = os.path.join(folder, f"{base_name} - Transcript (Words).json")
     cap_path   = os.path.join(folder, f"{base_name} (Captioned).mp4")
 
-    audio_temp = os.path.join(tempfile.gettempdir(), "foundry_audio_temp.wav")
-    success    = True
+    audio_temp  = os.path.join(tempfile.gettempdir(), "foundry_audio_temp.wav")
+    clean_source = None
+    success     = True
 
     try:
         # ── Transcription ─────────────────────────────────────────────────
@@ -445,8 +458,7 @@ def process_item(item, model):
             if not ensure_local(source):
                 log("  ✗ Could not download file from Dropbox — skipping.")
                 return False
-            # Copy to a clean temp path to avoid ffmpeg choking on special
-            # characters (&, apostrophes, accents, long paths, etc.)
+
             src_ext      = os.path.splitext(source)[1].lower()
             clean_source = os.path.join(tempfile.gettempdir(), f"foundry_src_temp{src_ext}")
             shutil.copy2(source, clean_source)
@@ -460,16 +472,18 @@ def process_item(item, model):
                 ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                    creationflags=0x08000000 if sys.platform == "win32" else 0)
             finally:
-                if os.path.exists(clean_source):
+                if clean_source and os.path.exists(clean_source):
                     try:
                         os.remove(clean_source)
+                        clean_source = None
                     except Exception:
                         pass
 
             log(f"  Transcribing with Whisper {WHISPER_MODEL}...")
             result   = model.transcribe(audio_temp, language="en", word_timestamps=True)
             segments = result["segments"]
-            os.remove(audio_temp)
+            if os.path.exists(audio_temp):
+                os.remove(audio_temp)
             log(f"  ✓ Transcription complete — {len(segments)} segments.")
 
             if item["needs_srt"]:
@@ -503,13 +517,11 @@ def process_item(item, model):
         log(f"  ✗ ERROR: {e}")
         success = False
     finally:
-        # Clean up temp files after processing
-        try:
-            if 'clean_source' in locals() and clean_source and os.path.exists(clean_source):
+        if clean_source and os.path.exists(clean_source):
+            try:
                 os.remove(clean_source)
-                log(f"  ✓ Temp file cleaned up.")
-        except Exception as e:
-            log(f"  Warning: could not clean temp file: {e}")
+            except Exception:
+                pass
         if os.path.exists(audio_temp):
             try:
                 os.remove(audio_temp)
@@ -533,7 +545,6 @@ class StatusWindow:
         self.progress_bar = None
         self.done_btn     = None
 
-    # ── Thread-safe UI updates ────────────────────────────────────────────────
     def _append_log(self, msg):
         if self.log_text and self.root:
             self.root.after(0, self._do_append, msg)
@@ -552,7 +563,6 @@ class StatusWindow:
         if self.progress_bar and self.root:
             self.root.after(0, lambda: self.progress_bar.config(value=value))
 
-    # ── UI construction ───────────────────────────────────────────────────────
     def _build_ui(self):
         root = tk.Tk()
         root.title("Foundry — Processing Videos")
@@ -565,10 +575,8 @@ class StatusWindow:
         y    = (root.winfo_screenheight() - h) // 2
         root.geometry(f"{w}x{h}+{x}+{y}")
 
-        # Orange header stripe
         tk.Frame(root, bg=CF_ORANGE, height=5).pack(fill="x")
 
-        # Title row
         title_row = tk.Frame(root, bg=CF_BG)
         title_row.pack(fill="x", padx=20, pady=(14, 2))
         tk.Label(title_row, text="Foundry Video Processor",
@@ -577,7 +585,6 @@ class StatusWindow:
         tk.Label(title_row, text=f"{len(self.work_items)} video(s) queued",
                  font=("Segoe UI", 9), bg=CF_BG, fg=CF_GRAY).pack(side="right", pady=2)
 
-        # 3MB alert (shown only if needed)
         if self.new_3mb:
             alert = tk.Frame(root, bg="#3A1A00")
             alert.pack(fill="x", padx=20, pady=(4, 0))
@@ -586,13 +593,11 @@ class StatusWindow:
                      font=("Segoe UI", 9), anchor="w",
                      bg="#3A1A00", fg=CF_AMBER).pack(fill="x", pady=5, padx=8)
 
-        # Status line
         self.status_label = tk.Label(root, text="Waiting...",
                                      font=("Segoe UI", 9),
                                      bg=CF_BG, fg=CF_GRAY, anchor="w")
         self.status_label.pack(fill="x", padx=20, pady=(8, 2))
 
-        # Progress bar
         style = ttk.Style()
         style.theme_use("default")
         style.configure("F.Horizontal.TProgressbar",
@@ -608,7 +613,6 @@ class StatusWindow:
                                              maximum=max(len(self.work_items), 1))
         self.progress_bar.pack(fill="x", padx=20, pady=(0, 8))
 
-        # Log panel
         log_outer = tk.Frame(root, bg=CF_SURFACE,
                              highlightthickness=1, highlightbackground=CF_BORDER)
         log_outer.pack(fill="both", expand=True, padx=20, pady=(0, 10))
@@ -627,7 +631,6 @@ class StatusWindow:
         scrollbar.pack(side="right", fill="y")
         self.log_text.pack(side="left", fill="both", expand=True)
 
-        # Buttons
         btn_row = tk.Frame(root, bg=CF_BG)
         btn_row.pack(fill="x", padx=20, pady=(0, 14))
 
@@ -650,7 +653,6 @@ class StatusWindow:
 
         self.root = root
 
-    # ── Processing thread ─────────────────────────────────────────────────────
     def _processing_thread(self):
         global _log_callback
         _log_callback = self._append_log
@@ -663,7 +665,6 @@ class StatusWindow:
         log(f"Started: {now}")
         log()
 
-        # Load Whisper
         self._set_status("Loading Whisper model...", CF_AMBER)
         log("Loading Whisper model (this may take a moment)...")
         try:
@@ -681,7 +682,7 @@ class StatusWindow:
 
         for i, item in enumerate(self.work_items, 1):
             fname = os.path.basename(item["source"])
-            label = f"[{i}/{len(self.work_items)}] [{item['lib_name']}] {item['base_name']}"
+            label = f"[{i}/{len(self.work_items)}] {item['display_path']} — {item['base_name']}"
             log(label)
             self._set_status(label, CF_AMBER)
 
@@ -700,7 +701,6 @@ class StatusWindow:
             self._set_progress(i)
             log()
 
-        # Summary
         log("═" * 48)
         log(f"✓ Processed : {done}")
         log(f"  Errors    : {len(errors)}")
@@ -719,10 +719,8 @@ class StatusWindow:
         mark_ran_today()
         write_log()
 
-        # Release sleep prevention
         ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
 
-        # Activate Done button
         self.root.after(0, lambda: self.done_btn.config(
             state="normal",
             bg=CF_ORANGE, fg=CF_WHITE,
@@ -730,7 +728,6 @@ class StatusWindow:
             activeforeground=CF_WHITE,
         ))
 
-    # ── Run ───────────────────────────────────────────────────────────────────
     def run(self):
         self._build_ui()
         t = threading.Thread(target=self._processing_thread, daemon=False)
@@ -743,8 +740,6 @@ class StatusWindow:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    # --now flag: skip the sync wait and ran-today guard, run immediately
-    # Use this when triggering manually (e.g. at lunch break)
     run_now = "--now" in sys.argv
 
     if not run_now and already_ran_today():
@@ -756,8 +751,8 @@ def main():
         print(f"Waiting {DROPBOX_SYNC_WAIT}s for Dropbox to sync...")
         time.sleep(DROPBOX_SYNC_WAIT)
 
-    print("Scanning libraries...")
-    work_items = scan_libraries()
+    print("Scanning Dropbox for videos missing transcripts or captions...")
+    work_items = scan_dropbox()
     new_3mb    = scan_3mb()
 
     if not work_items and not new_3mb:
