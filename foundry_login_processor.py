@@ -340,10 +340,65 @@ def srt_time(s):
 
 
 def make_srt(segments):
+    """
+    Build SRT from word-level timestamps so captions refresh at natural speech pace.
+    Groups words into chunks of MAX_WORDS_PER_CAPTION, each chunk becomes one SRT entry.
+    This prevents long Whisper segments from producing walls of text on screen.
+
+    Falls back to segment-level timing if word timestamps are not available.
+    Horizontal 3MB captions are unaffected in quality — this only improves fast-refresh
+    for longer segments (e.g. vertical iPhone Unstuck footage).
+    """
+    MAX_WORDS    = 10   # max words per caption entry (~2 lines)
+    MAX_LINE_LEN = 35   # chars per line before wrapping to second line
+
+    # Flatten all words with their timestamps from word-level data
+    all_words = []
+    for seg in segments:
+        if "words" in seg and seg["words"]:
+            for w in seg["words"]:
+                word  = w.get("word", "").strip()
+                start = w.get("start", seg["start"])
+                end   = w.get("end",   seg["end"])
+                if word:
+                    all_words.append({"word": word, "start": start, "end": end})
+        else:
+            # No word-level timestamps — fall back to segment as one entry
+            all_words.append({
+                "word":  seg["text"].strip(),
+                "start": seg["start"],
+                "end":   seg["end"],
+                "_is_segment": True,
+            })
+
+    if not all_words:
+        return ""
+
+    # Group words into chunks of MAX_WORDS
+    chunks = []
+    i = 0
+    while i < len(all_words):
+        chunk = all_words[i:i + MAX_WORDS]
+        # If this is a fallback segment entry, keep it as-is
+        if chunk[0].get("_is_segment"):
+            chunks.append(chunk)
+            i += 1
+        else:
+            chunks.append(chunk)
+            i += MAX_WORDS
+
+    # Build SRT entries
     lines = []
-    for i, seg in enumerate(segments, 1):
-        wrapped = "\n".join(textwrap.wrap(seg["text"].strip(), 42))
-        lines += [str(i), f"{srt_time(seg['start'])} --> {srt_time(seg['end'])}", wrapped, ""]
+    for idx, chunk in enumerate(chunks, 1):
+        start = chunk[0]["start"]
+        end   = chunk[-1]["end"]
+        if chunk[0].get("_is_segment"):
+            text = chunk[0]["word"]
+        else:
+            text = " ".join(w["word"] for w in chunk)
+        wrapped = "\n".join(textwrap.wrap(text, MAX_LINE_LEN))
+        lines += [str(idx), f"{srt_time(start)} --> {srt_time(end)}", wrapped, ""]
+
     return "\n".join(lines)
 
 
