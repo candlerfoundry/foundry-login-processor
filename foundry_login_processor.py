@@ -243,13 +243,18 @@ def scan_dropbox():
         # Audio-only: determined by file type, not folder name
         audio_only = source.lower().endswith('.mp3')
 
+        # Theological Reflections videos have animated graphics throughout.
+        # Burning captions would compete with those graphics — never caption these.
+        theo_reflections_path = os.path.join(DROPBOX_ROOT, "Unstuck", "Theological Reflections")
+        is_theological_reflections = root.startswith(theo_reflections_path)
+
         got_srt   = has_srt(files)
         got_words = has_words_json(files)
         got_cap   = has_captioned(files)
 
         needs_srt   = not got_srt
         needs_words = not got_words
-        needs_cap   = not audio_only and not got_cap
+        needs_cap   = not audio_only and not got_cap and not is_theological_reflections
 
         if needs_srt or needs_words or needs_cap:
             # Human-readable path for display (relative to Dropbox root)
