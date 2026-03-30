@@ -92,6 +92,75 @@ WHISPER_MODEL    = "medium"
 STYLE_STR        = "Fontname=Arial,Outline=1,Shadow=0,BorderStyle=1,Spacing=1"
 DROPBOX_SYNC_WAIT = 60  # seconds to wait for Dropbox to sync on login
 
+CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+
+
+# ── Adaptive caption sizing ──────────────────────────────────────────────────
+
+def get_video_dimensions(video_path, ffmpeg_exe):
+    """Returns (width, height) using ffprobe. Returns (1920, 1080) as safe default on failure."""
+    def _probe(ffprobe_exe):
+        result = subprocess.run(
+            [ffprobe_exe, '-v', 'error', '-select_streams', 'v:0',
+             '-show_entries', 'stream=width,height', '-of', 'json', video_path],
+            capture_output=True, text=True, timeout=10,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        data = json.loads(result.stdout)
+        w = data['streams'][0]['width']
+        h = data['streams'][0]['height']
+        print(f'[dimensions] {video_path}: {w}x{h}')
+        return w, h
+
+    # Derive ffprobe path from ffmpeg path; fall back to bare 'ffprobe'
+    ffprobe = ffmpeg_exe.replace('ffmpeg.exe', 'ffprobe.exe') if ffmpeg_exe != 'ffmpeg' else 'ffprobe'
+    try:
+        return _probe(ffprobe)
+    except Exception as e:
+        if ffprobe != 'ffprobe':
+            try:
+                return _probe('ffprobe')
+            except Exception:
+                pass
+        print(f'[dimensions] ffprobe failed, using default 1920x1080: {e}')
+        return 1920, 1080
+
+
+def get_caption_style(width, height):
+    """
+    Returns a dict of ffmpeg subtitle style params based on video dimensions.
+    Vertical (portrait): larger font, higher vertical position, narrower margins.
+    Horizontal (landscape): standard font and positioning.
+    Square: intermediate values.
+    """
+    aspect = width / height if height > 0 else 1.78
+
+    if aspect < 0.75:      # vertical / portrait (e.g. 9:16 iPhone, 1080x1920)
+        return {
+            'fontsize': 36,
+            'margin_v': int(height * 0.12),
+            'margin_h': int(width * 0.05),
+            'bold': 1,
+            'label': 'vertical',
+        }
+    elif aspect > 1.4:     # horizontal / landscape (e.g. 16:9)
+        return {
+            'fontsize': 22,
+            'margin_v': int(height * 0.06),
+            'margin_h': int(width * 0.04),
+            'bold': 1,
+            'label': 'horizontal',
+        }
+    else:                  # square or near-square
+        return {
+            'fontsize': 28,
+            'margin_v': int(height * 0.08),
+            'margin_h': int(width * 0.04),
+            'bold': 1,
+            'label': 'square',
+        }
+
+
 # ── Brand colors ──────────────────────────────────────────────────────────────
 CF_ORANGE  = "#E8541A"
 CF_BG      = "#111111"
@@ -466,6 +535,15 @@ def burn_captions(video_in, srt_path, video_out):
     tmp_srt   = os.path.join(tmp_dir, "foundry_caption_temp.srt")
     tmp_video = os.path.join(tmp_dir, "foundry_src_burn_temp.mp4")
 
+    # Detect video dimensions for adaptive caption sizing (before video_in is reassigned)
+    width, height = get_video_dimensions(video_in, "ffmpeg")
+    cap_style = get_caption_style(width, height)
+    print(f'[captions] Orientation: {cap_style["label"]} — fontsize {cap_style["fontsize"]}')
+    dynamic_style = (
+        f"Fontsize={cap_style['fontsize']},{STYLE_STR},"
+        f"MarginV={cap_style['margin_v']},MarginH={cap_style['margin_h']}"
+    )
+
     shutil.copy2(video_in, tmp_video)
     shutil.copy2(srt_path, tmp_srt)
     srt_escaped = tmp_srt.replace("\\", "/").replace(":", "\\:")
@@ -474,12 +552,12 @@ def burn_captions(video_in, srt_path, video_out):
     result = subprocess.run([
         "ffmpeg", "-y",
         "-i", video_in,
-        "-vf", f"subtitles='{srt_escaped}':force_style='{STYLE_STR}'",
+        "-vf", f"subtitles='{srt_escaped}':force_style='{dynamic_style}'",
         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
         "-c:a", "copy",
         temp_out
     ], capture_output=True, text=True,
-       creationflags=0x08000000 if sys.platform == "win32" else 0)
+       creationflags=CREATE_NO_WINDOW)
 
     if result.returncode == 0 and os.path.exists(temp_out):
         shutil.copy2(temp_out, video_out)
